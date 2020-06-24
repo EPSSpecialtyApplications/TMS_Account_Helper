@@ -1,0 +1,3 @@
+
+class DataValidationError(Exception):
+	pass

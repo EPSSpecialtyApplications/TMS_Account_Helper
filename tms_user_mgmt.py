@@ -1,9 +1,12 @@
 import tkinter as tk
 from tkinter import ttk
-from config import TMS_DEV_CONNECT as CNXN
+from tkinter import messagebox
+from config import TMS_PRD_CONNECT as CNXN
 from mappy.client import Client
 from datetime import datetime
-
+from tms_data_config import TMSDefaults
+import pyodbc
+import logging
 
 COLBY_KING = 1311
 RECORD_DEFAULTS = {
@@ -65,6 +68,9 @@ class TMSUserMGMTApp(object):
 			'Clear'
 		)
 
+		logging.basicConfig(filename='TMS User Management.log', filemode='a', level=logging.DEBUG)
+		self.__app_logger = logging.getLogger('TMS User Management')
+
 		self.__values_lookup = {}
 
 		self.__forms = self.build_input_forms(self.__left_frame)
@@ -76,15 +82,36 @@ class TMSUserMGMTApp(object):
 	def start(self):
 		tk.mainloop()
 
+	def lookup_segment_id(self, segment):
+		segment = segment.strip()
+		if segment.isnumeric():
+			segment = int(segment)
+			if segment in TMSDefaults.SEGMENT_IDS:
+				return segment
+		else:
+			segment = segment.upper()
+			try:
+				segment = TMSDefaults.SEGMENTS[segment]
+				return segment
+			except KeyError:
+				pass
+		return None
+
 	def update_with_segment_data(self, sv):
 		try:
-			segment_id = sv.get()
-			if segment_id > 0 and segment_id < 30:
-				self._filter_user_groups(segment_id)
-				self._filter_skills(segment_id)
-				self.__filter_accounts(segment_id)
-				self.__filter_wo_query(segment_id)
-				self.__filter_asset_query(segment_id)
+			segment = sv.get()
+			segment_id = self.lookup_segment_id(segment)
+			if segment_id:
+				try:
+					self._filter_user_groups(segment_id)
+					self._filter_skills(segment_id)
+					self.__filter_accounts(segment_id)
+					self.__filter_wo_query(segment_id)
+					self.__filter_asset_query(segment_id)
+				except pyodbc.Error as e:
+					messagebox.showerror("Error", "An error occured while getting form data")
+					print(e)
+
 		except tk.TclError:
 			pass
 
@@ -184,7 +211,7 @@ class TMSUserMGMTApp(object):
 			label = tk.Label(row, width=22, text=field, anchor='w')
 			sv = None
 			if field == 'Segment':
-				sv = tk.IntVar()
+				sv = tk.StringVar()
 				sv.trace('w', lambda name, index, mode, sv=sv: self.update_with_segment_data(sv))
 			entry = tk.Entry(row, width=45, textvariable=sv)
 			entry.insert(0, '0')
@@ -261,7 +288,9 @@ class TMSUserMGMTApp(object):
 			'IDResource': resource_id,
 			'MustChangePassword': 0,
 			'NoChangePassword': 0,
-			'NeverExpirePassword': 0
+			'NeverExpirePassword': 0,
+			'DefaultResource': 1,
+			'AssignResource': 1
 		}
 		user.update(CREATED_DEFAULTS)
 		tblTMSUsers = self.mappy.get_table('tblTMSUsers')
@@ -282,87 +311,95 @@ class TMSUserMGMTApp(object):
 
 
 	def __create_mobile_profile(self, data, user_id, resource_id):
-		print('Submitting Mobile profile...')
-		print(user_id, resource_id)
-		mp = {
+		"""Creates Mobile Profile record in tmsenterprise.TMSMobileProfiles"""
+		mp_data = {
 			'IDSegment': data['IDSegment'],
-			'IDSegmentForProfileData': 0,
 			'Name': (data['LastName'].lower().capitalize() + ', ' + data['FirstName'].lower().capitalize()),
 			'IDUser': user_id,
 			'IDResource': resource_id,
-			'ShowWOModule': 0,
-			'ShowAssetModule': 0,
-			'ShowWOWizard': 0,
-			'ShowMaterialReceipt': 0,
-			'ShowPhysicalCounts': 0,
 			'IDWOQuery': data['IDWOQuery'],
 			'IDAssetQuery': data['IDAssetQuery'],
-			'AllUsersWOs': 1,
-			'AllWOs': 0,
-			'AllUsersAssets': 1,
-			'AllAssets': 0,
-			'AllMaterials': 0,
-			'ShowTaskReadings': 0,
-			'ShowMaterialIssues': 0,
-			'ShowQuickClose': 0,
-			'ShowTimeCharges': 0,
-			'RequireSBL': 0,
-			'PromptForWO': 0,
-			'AllowProfileChanges': 0,
-			'ShowAssetSweep': 0,
-			'UseAutomaticTimeCharges': 0,
-			'DisableGroupWOCreate': 0,
-			'ShowInWOQuery': 706,
-			'MyWorkOrdersBy': 432,
-			'IDFormWorkOrder': '57CA57E5-610B-4185-B68F-F700B782AF9A',
-			'IDFormAsset': '2E2DB66F-4A63-4EE8-B634-1EB5907DF1D2',
-			'IDFormMyWorkOrders': '19D8EF44-97C2-4048-B946-8D0E800AF3FB',
-			'ShowCompletedWorkOrders': 0
 		}
+		mp_data.update(TMSDefaults.MOBILE_PROFILE_DEFAULTS)
 		tblTMSMobileProfiles = self.mappy.get_table('tblTMSMobileProfiles')
-		tblTMSMobileProfiles.add(**mp)
+		tblTMSMobileProfiles.add(**mp_data)
 		tblTMSMobileProfiles.execute()
 		mp_id = tblTMSMobileProfiles.get_last_insert_id()
-		print('Mobile Profiles created -- SUCCESS! {}'.format(mp_id))
+		return mp_id
 
+	def clear_input_forms(self):
+		for name, form in self.__forms.items():
+			form.delete(0, 'end')
 
-
-	def __submit_user(self, data):
+	def __submit_user(self, data, make_resource, make_mobile_profile):
 		resource_id = None
 		user_id = None
 		mp_id = None
 
-		if data['CreateResource']:
-			resource_id = self.__create_resource(data)
-			print('SUCCESS Resource Added:', resource_id)
+		try:
+			if make_resource:
+				resource_id = self.__create_resource(data)
+				self.__app_logger.info('{}: Created resource: {}'.format(data['Email'], resource_id))
 
-		user_id = self.__create_user_account(data, resource_id, data['IDTMSGroup'])
+			user_id = self.__create_user_account(data, resource_id, data['IDTMSGroup'])
+			self.__app_logger.info('{}: Created User: {}'.format(data['Email'], user_id))
 
-		if data['CreateProfile'] and resource_id:
-			mp_id = self.__create_mobile_profile(data, user_id, resource_id)
+			if make_mobile_profile:
+				mp_id = self.__create_mobile_profile(data, user_id, resource_id)
+				self.__app_logger.info('{}: Created resource: {}'.format(data['Email'], mp_id))
+		except pyodbc.Error as e:
+			messagebox.showerror("Error", "A database error occured while trying to create the user")
+			print(e)
+
+		self.clear_input_forms()
+
+
+
 
 
 	def submit_command(self):
+		""" Code that runs after hitting the submit button"""
+
 		data = {}
+		make_resource = self.__checkboxes['Resource'].get()
+		make_mobile_profile = self.__checkboxes['Mobile Profile'].get()
+		submit_error = False
+		
+		# Gather data to create user
 		try:
-			data['IDSegment'] = int(self.__forms['Segment'].get())
-			data['ResourceNumber'] = self.__forms['Resource #'].get()
-			data['Email'] = self.__forms['Email'].get()
-			data['PagerEmail'] = self.__forms['PagerEmail'].get()
+			data['IDSegment'] = self.lookup_segment_id(self.__forms['Segment'].get())
 			data['FirstName'] = self.__forms['FirstName'].get()
 			data['LastName'] = self.__forms['LastName'].get()
 			data['IDTMSGroup'] = self.__values_lookup['TMSUserGroup'][self.__dropdowns['TMSUserGroup'].get()]['IDTMSGroup']
+			data['Email'] = self.__forms['Email'].get()
+			if not data['IDSegment']:
+				messagebox.showerror('Error', 'Invalid segment')
+				return
+
+		except KeyError as e:
+			print(e)
+			messagebox.showerror('Error', 'Can''t Create user without a Segment, name and group')
+			return
+
+		# Gather data to create resource
+		try:
+			data['ResourceNumber'] = self.__forms['Resource #'].get()
+			data['PagerEmail'] = self.__forms['PagerEmail'].get()			
 			data['IDAccount'] = self.__values_lookup['UserAccount'][self.__dropdowns['UserAccount'].get()]['IDAccount']
 			data['IDSkill'] = self.__values_lookup['UserSkill'][self.__dropdowns['UserSkill'].get()]['IDSkill']
+		except ValueError as e:		
+			messagebox.showerror('Error', 'Cant create a resource without Resource #, email, pager, account, and skill')
+			return
+
+		# Gather data to create mobile profile 
+		try:
 			data['IDWOQuery'] = self.__values_lookup['MobileProfileWOQuery'][self.__dropdowns['MobileProfileWOQuery'].get()]['IDWOQuery']
 			data['IDAssetQuery'] = self.__values_lookup['MobileProfileAssetQuery'][self.__dropdowns['MobileProfileAssetQuery'].get()]['IDAssetQuery']
-			data['CreateResource'] = self.__checkboxes['Resource'].get()
-			data['CreateProfile'] = self.__checkboxes['Mobile Profile'].get()
-			self.__submit_user(data)
-
-			
 		except ValueError as e:
-			pass
+			messagebox.showerror('Error', 'Cant create a mobile profile without WOQuery and Asset forms')
+			return
+
+		self.__submit_user(data, make_resource, make_mobile_profile)
 
 
 	def build_buttons(self, parent):
